@@ -30,6 +30,16 @@
 //	= 128 + most recent raw readings.
 // That's not too big for 5 whole years.
 //
+// Note that this module does not record logs "for an hour" and then
+// collapse them into a single hour-level entry, or record "for a minute"
+// and collapse to a minute-level entry. It does its collapsing when the
+// clock time shows a transition to the next hour or next minute, etc. So,
+// "a month" is not just so many days -- it starts at the beginning of a
+// calendar month and wraps to the next month at the time the month moves
+// to the next, as per the local date and time of the system where the
+// software is running. In our language, the minutes, hours, etc, "wrap"
+// to the next minute, next hour, etc.
+//
 // Loading and storing
 //
 // One can load and store a HistLog object from a file, or read/write it from
@@ -38,44 +48,42 @@ package histstats
 
 import (
     "io"
+    "time"
 )
 
-type DoW int
-type Month int
-
+// Each log entry in the HistLog set will have a type, which will be one
+// of these types
+type entrytype int
 const (
-    Sun DoW = iota
-    Mon
-    Tue
-    Wed
-    Thu
-    Fri
-    Sat
-
-    Jan Month = iota
-    Feb
-    Mar
-    Apr
-    May
-    Jun
-    Jul
-    Aug
-    Sep
-    Oct
-    Nov
-    Dec
+    etypeRaw		entrytype = iota
+    etypeMinute
+    etypeHour
+    etypeDay
+    etypeWeek
+    etypeMonth
+    etypeYear
 )
 
-type countval struct {
-    count, val	int
+type Count_t	int64
+type Val_t	int64
+type entryLabel_t	[5]int16
+
+type histlogentry struct {
+    t		entrytype
+    elabel	entryLabel_t	// "entry label", telling you which time slice this reading is for
+    count	Count_t
+    val		Val_t
 }
 
+//
 // One HistLog object can hold one set of data points for historical statistics
 // of one attribute.
+//
 type HistLog struct {
-    logentries	map[string]countval
+    lastchecked	time.Time	// timestamp of when we last checked for wraps
+    logs	[]histlogentry
     day2month	bool	// true means days collapse to months, false means days collapse to weeks
-    weekstart	DoW	// Sun or Mon in most places, Fri in some Middle Eastern countries
+    weekstart	time.Weekday	// Sun or Mon in most places, Fri in some Middle Eastern countries
     agelimit	int	// in years, typically a small single-digit figure
     store	io.ReadWriteCloser	// where the object is stored in file
     storePath	string	// filename for store
@@ -85,12 +93,14 @@ type HistLog struct {
     			// false ==> club them at hour boundaries,
 }
 
+
+//
 // Called when you want to create a new HistLog instance from scratch
 //
 //	d2m: true means you want days to collapse to months, false
 //		means days collapse to weeks, and 52 weeks a year
 //	weekstart: set it to Sunday, Monday or Friday to decide when
-//		to collapse days to a week. Only relevant if d2m == false
+//		to collapse days into a week. Only relevant if d2m == false
 //	agelimit: set it to a small integer to decide how many years of
 //		data to remember
 //	af: nil means no auto-flush, an integer means auto-flush after
@@ -100,17 +110,160 @@ type HistLog struct {
 //		readings to be clubbed into minutes at minute boundaries
 //		first, then those minutes get clubbed into hours at hour
 //		boundaries
-func NewHistLog(d2m bool, weekstart DoW, agelimit, af int, clubtomins bool) (l HistLog) { }
+//
+// func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int, clubtomins bool) (l HistLog) { }
 
-// Called to load a HistLog from its backing store (a file), and this
-// file name is remembered for later Flush() calls
-func Load(filename string) (l HistLog, err error) { }
+//
+// Called to instantiate and load a HistLog from its backing store (a file);
+// this file name is remembered for later Flush() calls
+//
+// func Load(filename string) (l HistLog, err error) { }
 
-// Called to load a HistLog object from a file from any I/O endpoint
-func Read(io.Reader) (l HistLog, err error) { }
+//
+// Called to instantiate and read a HistLog object from any I/O endpoint
+// A HistLog instance created by Read() does not have its flush-store
+// filename set, so calls to Flush() will fail unless you set the
+// filename by making a call to SetFlushToFile() first
+//
+// func Read(io.Reader) (l HistLog, err error) { }
 
-func (l HistLog) IncrBy(i int) (int) { }
-func (l HistLog) Log(count, val int) { }
-func (l HistLog) Flush() (err error) { }
-func (l HistLog) Write(io.Writer) (err error) { }
-func (l HistLog) SetFlushToFile(io.Writer) (err error) { }
+//
+// This critical internal function detects if there has been any wrapping
+// of any of the time units (year, month, etc) between the last checked
+// time and now. If there has been, it does a collapsing of all records
+// which need collapsing. This is the heart of the package. If this works
+// correctly, Covid19 lockdowns are a pot of payasam.
+//
+func (l HistLog) doWrap() {
+
+    // very critical check to see if time has moved backwards, as often
+    // happens with system clock being reset or timezone changes. We work
+    // with local time, which can move back and forth.
+    if time.Now().Sub(l.lastchecked) < 0 {
+
+	// if time has indeed moved backwards, we will just do nothing in
+	// each call to doWrap(), and bide our time till time once again
+	// moves forward, i.e. current system time is "after" l.lastchecked
+	return
+    }
+
+    t := time.Now()
+    lastyr, lastmth, lastdate := l.lastchecked.Date()
+    var lastweek	int
+    if !l.day2month {
+	lastyr, lastweek = l.lastchecked.ISOWeek()
+	lastdate = int(l.lastchecked.Weekday())
+    }
+    lasthr, lastmin, _  := l.lastchecked.Clock()
+
+    nowyr, nowmth, nowdate    := t.Date()
+    var nowweek		int
+    if !l.day2month {
+	nowyr, nowweek = t.ISOWeek()
+	nowdate = int(t.Weekday())
+    }
+    nowhr, nowmin, _     := t.Clock()
+
+    var wraptype entrytype
+
+    if nowyr > lastyr {		// the year has wrapped since last time
+	wraptype = etypeYear
+    } else if l.day2month {
+	if nowmth > lastmth {
+	    wraptype = etypeMonth
+	} else if nowdate > lastdate {
+	    wraptype = etypeDay
+	} else if nowhr > lasthr {
+	    wraptype = etypeHour
+	} else if nowmin > lastmin {
+	    wraptype = etypeMinute
+	}
+    } else {
+	if nowweek > lastweek {
+	    wraptype = etypeWeek
+	} else if nowdate > lastdate {
+	    wraptype = etypeDay
+	} else if nowhr > lasthr {
+	    wraptype = etypeHour
+	} else if nowmin > lastmin {
+	    wraptype = etypeMinute
+	}
+    }
+
+
+    if wraptype >= etypeMinute {
+	logEntryCollapse(&l, etypeRaw, etypeMinute)
+    }
+    if wraptype >= etypeHour {
+	logEntryCollapse(&l, etypeMinute, etypeHour)
+    }
+    if wraptype >= etypeDay {
+	logEntryCollapse(&l, etypeHour, etypeDay)
+    }
+    if l.day2month {
+	if wraptype >= etypeMonth {
+	    logEntryCollapse(&l, etypeDay, etypeMonth)
+	    if wraptype >= etypeYear {
+		logEntryCollapse(&l, etypeMonth, etypeYear)
+	    }
+	}
+    } else {
+	if wraptype >= etypeWeek {
+	    logEntryCollapse(&l, etypeDay, etypeWeek)
+	    if wraptype >= etypeYear {
+		logEntryCollapse(&l, etypeWeek, etypeYear)
+	    }
+	}
+    }
+
+    l.lastchecked = t
+}
+
+//
+// Collapses all the log entries of a specific type and replaces
+// them with a new entry of the next "fatter" type.
+//
+func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entrytype) {
+    var totalcount Count_t
+    var totalvals  Val_t
+    var thisentry histlogentry
+    var lastyr, lastmth, lastweek, lastdate, lasthr, lastmin	int
+    var acertainmonth time.Month
+
+    lastyr, acertainmonth, lastdate = (*lptr).lastchecked.Date()
+    lastmth = int(acertainmonth)
+
+    if !(*lptr).day2month {
+	lastyr, lastweek = (*lptr).lastchecked.ISOWeek()
+	lastdate = int((*lptr).lastchecked.Weekday())
+    }
+    lasthr, lastmin, _  = (*lptr).lastchecked.Clock()
+
+    // We aggregate all the lower-level entries...
+    for _, thisentry = range (*lptr).logs {
+	if thisentry.t == wrapfrom {
+	    totalcount += thisentry.count
+	    totalvals  += thisentry.val
+	}
+    }
+    // ... and create a new entry
+    thisentry.count = totalcount
+    thisentry.val   = totalvals
+    thisentry.t     = collapseto
+    // thisentry.elabel entryLabel_t
+
+    onelabel := entryLabel_t{ int16(lastyr), int16(lastweek), int16(lastdate),
+	    int16(lasthr), int16(lastmin) }
+    thisentry.elabel = onelabel
+    if (*lptr).day2month {
+	thisentry.elabel[1] = int16(lastmth)
+    }
+    (*lptr).logs = append((*lptr).logs, thisentry)
+}
+
+
+// func (l HistLog) IncrBy(i int) (int) { }
+// func (l HistLog) Log(count, val int) { }
+// func (l HistLog) Flush() (err error) { }
+// func (l HistLog) Write(io.Writer) (err error) { }
+// func (l HistLog) SetFlushToFile(io.Writer) (err error) { }
