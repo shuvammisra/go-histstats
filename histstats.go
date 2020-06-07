@@ -47,8 +47,18 @@
 package histstats
 
 import (
+   // "fmt"
     "io"
+    "io/ioutil"
     "time"
+    "errors"
+    // "sync"
+//    "encoding/json"
+)
+
+const (
+    MONITOR_CHANNEL_DEPTH int	= 10	// increase and re-compile if needed
+    DATAFETCH_SLEEP_SEC	  int	= 2
 )
 
 // Each log entry in the HistLog set will have a type, which will be one
@@ -69,10 +79,10 @@ type Val_t	int64
 type entryLabel_t	[5]int16
 
 type histlogentry struct {
-    t		entrytype
-    elabel	entryLabel_t	// "entry label", telling you which time slice this reading is for
-    count	Count_t
-    val		Val_t
+    T		entrytype	`json:"type"`
+    Elabel	entryLabel_t	// "entry label", telling you which time slice this reading is for
+    Count	Count_t
+    Val		Val_t
 }
 
 //
@@ -80,17 +90,45 @@ type histlogentry struct {
 // of one attribute.
 //
 type HistLog struct {
-    lastchecked	time.Time	// timestamp of when we last checked for wraps
-    logs	[]histlogentry
-    day2month	bool	// true means days collapse to months, false means days collapse to weeks
-    weekstart	time.Weekday	// Sun or Mon in most places, Fri in some Middle Eastern countries
-    agelimit	int	// in years, typically a small single-digit figure
-    store	io.ReadWriteCloser	// where the object is stored in file
+    lastChecked	time.Time	// timestamp of when we last checked for wraps
+    Logs	[]histlogentry
+    Day2Month	bool	// true means days collapse to months, false means days collapse to weeks
+    Weekstart	time.Weekday	// Sun or Mon in most places, Fri in some Middle Eastern countries
+    Agelimit	int	// in years, typically a small single-digit figure
     storePath	string	// filename for store
-    isdirty	bool	// true ==> a flush is needed
-    autoflush	int	// if not nil, it means auto-flush every so many updates
-    clubtomins bool	// true ==> club current readings at minute boundaries, track individual minutes
-    			// false ==> club them at hour boundaries,
+    pendingLogs	int	// incremented each Log(), reset on each Flush()
+    Autoflush	int	// if not nil, it means auto-flush every so many updates
+    Club2mins	bool	// true ==> club current readings at minute boundaries, track individual minutes
+			// false ==> club them at hour boundaries,
+    closed	bool	// set to true after a Close() is called on the object
+    tomonitor	chan monmsg
+}
+
+//
+// Message types for messages sent to the monitor daemon thread
+//
+type mTypes	int
+const (
+    mTypeFlush	mTypes	= iota
+    mTypeIncr			// used to do a pure-count-incr logging
+    mTypeLog			// used to log an entry
+    mTypeSetFlushFile		// sets the flush-to filename
+    mTypeGet			// used for the read-from-file operation
+    mTypeSet			// used for write-to-file operation
+    mTypeClose			// monitor-thread winds up and exits
+)
+//
+// Messages sent to the monitor-daemon thread ... oops, goroutine
+//
+// These are one-way messages. An out-parameter sometimes comes back
+// via the strparam, which is a pointer to string, and which the monitor
+// thread will set with a string value, in the case of the Get call.
+//
+type monmsg struct {
+    mtype	mTypes
+    count	Count_t
+    val		Val_t
+    strparam	*string
 }
 
 
@@ -105,27 +143,93 @@ type HistLog struct {
 //		data to remember
 //	af: nil means no auto-flush, an integer means auto-flush after
 //		that many Log() or Incr() calls
-//	clubtomins: false means you are not interested in minute-level
+//	club2mins: false means you are not interested in minute-level
 //		data for the last hour, true means you want current
 //		readings to be clubbed into minutes at minute boundaries
 //		first, then those minutes get clubbed into hours at hour
 //		boundaries
 //
-// func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int, clubtomins bool) (l HistLog) { }
+func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
+	club2mins bool) (l HistLog) {
+    l.lastChecked	= time.Now()
+    l.Logs		= make([]histlogentry, 20)
+    l.Day2Month		= d2m
+    l.Weekstart		= weekstart
+    l.Agelimit		= agelimit
+//    l.storePath		= nil
+    l.pendingLogs	= 0
+    l.Autoflush		= af
+    l.Club2mins		= club2mins
+    l.closed		= false
+    l.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
+
+    return l
+}
 
 //
 // Called to instantiate and load a HistLog from its backing store (a file);
 // this file name is remembered for later Flush() calls
 //
-// func Load(filename string) (l HistLog, err error) { }
+func Load(filename string) (l *HistLog, err error) {
+    return l, err
+}
 
 //
-// Called to instantiate and read a HistLog object from any I/O endpoint
+// Called to instantiate and read a HistLog object from any I/O endpoint.
 // A HistLog instance created by Read() does not have its flush-store
 // filename set, so calls to Flush() will fail unless you set the
-// filename by making a call to SetFlushToFile() first
+// filename by making a call to SetFlushFile() first
 //
-// func Read(io.Reader) (l HistLog, err error) { }
+// Why does Load() set the flush-to filename of the instance created, but 
+// Read() does not? Because Load() takes a filename on disk as parameter 
+// to load from, whereas Read() is more generic and reads from any readable 
+// stream endpoint.
+//
+func Read(io.Reader) (l *HistLog, err error) {
+    return l, err
+}
+
+
+//
+// The monitor function which runs in a separate goroutine and performs
+// all actual operations on the HistLog instance. One goroutine runs per
+// active HistLog instance.
+//
+func monitor(l *HistLog) {
+    for {
+	select {
+	case msg := <-(*l).tomonitor:
+	    if !((*l).closed) {
+		switch msg.mtype {
+		case mTypeFlush: {
+		    // do a json.marshall, then flush the string to file
+		}
+		case mTypeIncr: {
+		    loginternal(l, msg.count, Val_t(0))
+		}
+		case mTypeLog: {
+		    loginternal(l, msg.count, msg.val)
+		}
+		case mTypeSetFlushFile: {
+		    if (msg.strparam != nil) && ((*msg.strparam) != "") {
+			(*l).storePath = (*msg.strparam)
+		    } else {
+			panic("call to SetFlushFile with empty flush filename")
+		    }
+		}
+		case mTypeGet:
+		case mTypeSet:
+		case mTypeClose:
+		    (*l).closed = true
+		}
+	    }
+	case <-time.After(time.Minute):
+	    if !((*l).closed) {
+		doWrap(l)
+	    }
+	}
+    }
+}
 
 //
 // This critical internal function detects if there has been any wrapping
@@ -134,31 +238,31 @@ type HistLog struct {
 // which need collapsing. This is the heart of the package. If this works
 // correctly, Covid19 lockdowns are a pot of payasam.
 //
-func (l HistLog) doWrap() {
+func doWrap(lptr *HistLog) {
 
     // very critical check to see if time has moved backwards, as often
     // happens with system clock being reset or timezone changes. We work
     // with local time, which can move back and forth.
-    if time.Now().Sub(l.lastchecked) < 0 {
+    if time.Now().Sub((*lptr).lastChecked) < 0 {
 
 	// if time has indeed moved backwards, we will just do nothing in
 	// each call to doWrap(), and bide our time till time once again
-	// moves forward, i.e. current system time is "after" l.lastchecked
+	// moves forward, i.e. current system time is "after" l.lastChecked
 	return
     }
 
     t := time.Now()
-    lastyr, lastmth, lastdate := l.lastchecked.Date()
+    lastyr, lastmth, lastdate := (*lptr).lastChecked.Date()
     var lastweek	int
-    if !l.day2month {
-	lastyr, lastweek = l.lastchecked.ISOWeek()
-	lastdate = int(l.lastchecked.Weekday())
+    if !(*lptr).Day2Month {
+	lastyr, lastweek = (*lptr).lastChecked.ISOWeek()
+	lastdate = int((*lptr).lastChecked.Weekday())
     }
-    lasthr, lastmin, _  := l.lastchecked.Clock()
+    lasthr, lastmin, _  := (*lptr).lastChecked.Clock()
 
     nowyr, nowmth, nowdate    := t.Date()
     var nowweek		int
-    if !l.day2month {
+    if !(*lptr).Day2Month {
 	nowyr, nowweek = t.ISOWeek()
 	nowdate = int(t.Weekday())
     }
@@ -168,7 +272,7 @@ func (l HistLog) doWrap() {
 
     if nowyr > lastyr {		// the year has wrapped since last time
 	wraptype = etypeYear
-    } else if l.day2month {
+    } else if (*lptr).Day2Month {
 	if nowmth > lastmth {
 	    wraptype = etypeMonth
 	} else if nowdate > lastdate {
@@ -192,32 +296,32 @@ func (l HistLog) doWrap() {
 
 
     if wraptype >= etypeMinute {
-	logEntryCollapse(&l, etypeRaw, etypeMinute)
+	logEntryCollapse(lptr, etypeRaw, etypeMinute)
     }
     if wraptype >= etypeHour {
-	logEntryCollapse(&l, etypeMinute, etypeHour)
+	logEntryCollapse(lptr, etypeMinute, etypeHour)
     }
     if wraptype >= etypeDay {
-	logEntryCollapse(&l, etypeHour, etypeDay)
+	logEntryCollapse(lptr, etypeHour, etypeDay)
     }
-    if l.day2month {
+    if (*lptr).Day2Month {
 	if wraptype >= etypeMonth {
-	    logEntryCollapse(&l, etypeDay, etypeMonth)
+	    logEntryCollapse(lptr, etypeDay, etypeMonth)
 	    if wraptype >= etypeYear {
-		logEntryCollapse(&l, etypeMonth, etypeYear)
+		logEntryCollapse(lptr, etypeMonth, etypeYear)
 	    }
 	}
     } else {
 	if wraptype >= etypeWeek {
-	    logEntryCollapse(&l, etypeDay, etypeWeek)
+	    logEntryCollapse(lptr, etypeDay, etypeWeek)
 	    if wraptype >= etypeYear {
-		logEntryCollapse(&l, etypeWeek, etypeYear)
+		logEntryCollapse(lptr, etypeWeek, etypeYear)
 	    }
 	}
     }
 
-    l.lastchecked = t
-}
+    (*lptr).lastChecked = t
+}  // end doWrap()
 
 //
 // Collapses all the log entries of a specific type and replaces
@@ -228,42 +332,179 @@ func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entrytype) {
     var totalvals  Val_t
     var thisentry histlogentry
     var lastyr, lastmth, lastweek, lastdate, lasthr, lastmin	int
-    var acertainmonth time.Month
 
-    lastyr, acertainmonth, lastdate = (*lptr).lastchecked.Date()
-    lastmth = int(acertainmonth)
-
-    if !(*lptr).day2month {
-	lastyr, lastweek = (*lptr).lastchecked.ISOWeek()
-	lastdate = int((*lptr).lastchecked.Weekday())
+    {
+	var acertainmonth time.Month
+	lastyr, acertainmonth, lastdate = (*lptr).lastChecked.Date()
+	lastmth = int(acertainmonth)
     }
-    lasthr, lastmin, _  = (*lptr).lastchecked.Clock()
+
+    if !(*lptr).Day2Month {
+	lastyr, lastweek = (*lptr).lastChecked.ISOWeek()
+	lastdate = int((*lptr).lastChecked.Weekday())
+    }
+    lasthr, lastmin, _  = (*lptr).lastChecked.Clock()
 
     // We aggregate all the lower-level entries...
-    for _, thisentry = range (*lptr).logs {
-	if thisentry.t == wrapfrom {
-	    totalcount += thisentry.count
-	    totalvals  += thisentry.val
+    for _, thisentry = range (*lptr).Logs {
+	if thisentry.T == wrapfrom {
+	    totalcount += thisentry.Count
+	    totalvals  += thisentry.Val
 	}
     }
     // ... and create a new entry
-    thisentry.count = totalcount
-    thisentry.val   = totalvals
-    thisentry.t     = collapseto
-    // thisentry.elabel entryLabel_t
+    thisentry.Count = totalcount
+    thisentry.Val   = totalvals
+    thisentry.T     = collapseto
 
     onelabel := entryLabel_t{ int16(lastyr), int16(lastweek), int16(lastdate),
 	    int16(lasthr), int16(lastmin) }
-    thisentry.elabel = onelabel
-    if (*lptr).day2month {
-	thisentry.elabel[1] = int16(lastmth)
+    thisentry.Elabel = onelabel
+    if (*lptr).Day2Month {
+	thisentry.Elabel[1] = int16(lastmth)
     }
-    (*lptr).logs = append((*lptr).logs, thisentry)
+    (*lptr).Logs = append((*lptr).Logs, thisentry)
+} // end logEntryCollapse()
+
+//
+// Internal function to add a log entry to a HistLog instance. Called
+// from the monitor goroutine.
+//
+func loginternal(l *HistLog, count Count_t, val Val_t) {
+    var thisentry	histlogentry
+    var now		time.Time = time.Now()
+    var nowyr, nowmth, nowweek, nowdate, nowhr, nowmin	int
+
+    {
+	var acertainmonth time.Month
+	nowyr, acertainmonth, nowdate = now.Date()
+	nowmth = int(acertainmonth)
+    }
+    nowhr, nowmin, _ = now.Clock()
+    if !(*l).Day2Month {
+	nowyr, nowweek = now.ISOWeek()
+	nowdate = int(now.Weekday())
+    }
+    onelabel := entryLabel_t{ int16(nowyr), int16(nowmth),
+		int16(nowdate), int16(nowhr), int16(nowmin) }
+    if !(*l).Day2Month {
+	onelabel[1] = int16(nowweek)
+    }
+
+    thisentry.T		= etypeRaw
+    thisentry.Count	= count
+    thisentry.Val	= val
+    thisentry.Elabel	= onelabel
+
+    (*l).Logs = append((*l).Logs, thisentry)
 }
 
+//
+// Exported method to add a new entry to a HistLog instance.
+//
+func (l HistLog) Log(c Count_t, v Val_t) {
+    if l.closed == false {
+	var msg monmsg
 
-// func (l HistLog) IncrBy(i int) (int) { }
-// func (l HistLog) Log(count, val int) { }
-// func (l HistLog) Flush() (err error) { }
-// func (l HistLog) Write(io.Writer) (err error) { }
-// func (l HistLog) SetFlushToFile(io.Writer) (err error) { }
+	msg.mtype	= mTypeLog
+	msg.count	= c
+	msg.val		= v
+	msg.strparam	= nil
+
+	l.tomonitor <-msg
+    }
+}
+
+//
+// Exported method to add a new entry to a HistLog instance with just an
+// increment of the count
+//
+func (l HistLog) IncrBy(c Count_t) {
+    if l.closed == false {
+	var msg monmsg
+
+	msg.mtype	= mTypeIncr
+	msg.count	= c
+	msg.val		= Val_t(0)
+	msg.strparam	= nil
+
+	l.tomonitor <-msg
+    }
+}
+
+//
+// Set the flush-to filename.
+//
+func (l HistLog) SetFlushFile(flushtofilename string) (err error) {
+    if l.closed == false {
+	var somebytes = []byte{'a','b','c'}
+
+	err := ioutil.WriteFile(flushtofilename, somebytes, 0660)
+	if err != nil {
+	    var msg monmsg
+
+	    msg.mtype		= mTypeSetFlushFile
+	    msg.count		= Count_t(0)
+	    msg.val		= Val_t(0)
+	    *msg.strparam	= flushtofilename
+
+	    l.tomonitor<- msg
+	}
+	return err
+    }
+    return nil
+}
+
+//
+// Do an explicit flush of the HistLog to its pre-set flush-to file
+//
+func (l HistLog) Flush() (err error) {
+    if l.closed == false {
+	if l.storePath == "" {
+	    var msg	monmsg
+
+	    msg.mtype		= mTypeFlush
+	    msg.count		= Count_t(0)
+	    msg.val		= Val_t(0)
+	    msg.strparam	= nil
+
+	    l.tomonitor<- msg
+	    return nil
+	} else {
+	    return errors.New("flush-to filename not set")
+	}
+    }
+    return nil
+}
+
+//
+// Write out a nicely formatted representation of the HistLog object to
+// the given writable stream.
+//
+func (l HistLog) Write(w io.Writer) (err error) {
+    if l.closed == false {
+	var msg		monmsg
+	var fetcheddata	string
+
+	msg.mtype		= mTypeGet
+	msg.count		= Count_t(0)
+	msg.val			= Val_t(0)
+	msg.strparam		= &fetcheddata
+
+	l.tomonitor<- msg
+	//
+	// We go into a loop of sleeping and waiting, till the monitor
+	// goroutine gets us the data we are waiting for and loads it
+	// into the string which we've passed by reference.
+	//
+	for len(*msg.strparam) == 0 {
+	    time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second)
+	}
+	time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second) // for good measure
+
+	_, err := w.Write([]byte(*msg.strparam))
+	return err
+    }
+    return nil
+}
+
