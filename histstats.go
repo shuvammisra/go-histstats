@@ -48,6 +48,7 @@ package histstats
 
 import (
    // "fmt"
+    "os"
     "io"
     "io/ioutil"
     "time"
@@ -402,56 +403,64 @@ func loginternal(l *HistLog, count Count_t, val Val_t) {
 //
 // Exported method to add a new entry to a HistLog instance.
 //
-func (l HistLog) Log(c Count_t, v Val_t) {
-    if l.closed == false {
-	var msg monmsg
-
-	msg.mtype	= mTypeLog
-	msg.count	= c
-	msg.val		= v
-	msg.strparam	= nil
-
-	l.tomonitor <-msg
+func (l HistLog) Log(c Count_t, v Val_t) (error) {
+    if l.closed {
+	return errors.New("Log object is closed for business")
     }
+    var msg monmsg
+
+    msg.mtype	= mTypeLog
+    msg.count	= c
+    msg.val		= v
+    msg.strparam	= nil
+
+    l.tomonitor <-msg
+    return nil
 }
 
 //
 // Exported method to add a new entry to a HistLog instance with just an
 // increment of the count
 //
-func (l HistLog) IncrBy(c Count_t) {
-    if l.closed == false {
-	var msg monmsg
-
-	msg.mtype	= mTypeIncr
-	msg.count	= c
-	msg.val		= Val_t(0)
-	msg.strparam	= nil
-
-	l.tomonitor <-msg
+func (l HistLog) IncrBy(c Count_t) (error) {
+    if l.closed {
+	return errors.New("Log object is closed for business")
     }
+    var msg monmsg
+
+    msg.mtype	= mTypeIncr
+    msg.count	= c
+    msg.val		= Val_t(0)
+    msg.strparam	= nil
+
+    l.tomonitor <-msg
+    return nil
 }
 
 //
 // Set the flush-to filename.
 //
-func (l HistLog) SetFlushFile(flushtofilename string) (err error) {
-    if l.closed == false {
-	var somebytes = []byte{'a','b','c'}
-
-	err := ioutil.WriteFile(flushtofilename, somebytes, 0660)
-	if err != nil {
-	    var msg monmsg
-
-	    msg.mtype		= mTypeSetFlushFile
-	    msg.count		= Count_t(0)
-	    msg.val		= Val_t(0)
-	    *msg.strparam	= flushtofilename
-
-	    l.tomonitor<- msg
-	}
-	return err
+func (l HistLog) SetFlushFile(flushtofilename string) (error) {
+    if l.closed {
+	return errors.New("Log object is closed for business")
     }
+    var somebytes = []byte{'a','b','c'}
+
+    // do a trial write to the filename given
+    if e := ioutil.WriteFile(flushtofilename, somebytes, 0660); e != nil {
+	return e
+    }
+    if e := os.Remove(flushtofilename); e != nil {
+	return e
+    }
+    var msg monmsg
+
+    msg.mtype		= mTypeSetFlushFile
+    msg.count		= Count_t(0)
+    msg.val		= Val_t(0)
+    *msg.strparam	= flushtofilename
+
+    l.tomonitor<- msg
     return nil
 }
 
@@ -459,22 +468,22 @@ func (l HistLog) SetFlushFile(flushtofilename string) (err error) {
 // Do an explicit flush of the HistLog to its pre-set flush-to file
 //
 func (l HistLog) Flush() (err error) {
-    if l.closed == false {
-	if l.storePath == "" {
-	    var msg	monmsg
-
-	    msg.mtype		= mTypeFlush
-	    msg.count		= Count_t(0)
-	    msg.val		= Val_t(0)
-	    msg.strparam	= nil
-
-	    l.tomonitor<- msg
-	    return nil
-	} else {
-	    return errors.New("flush-to filename not set")
-	}
+    if l.closed {
+	return errors.New("Log object is closed for business")
     }
-    return nil
+    if l.storePath != "" {
+	var msg	monmsg
+
+	msg.mtype		= mTypeFlush
+	msg.count		= Count_t(0)
+	msg.val		= Val_t(0)
+	msg.strparam	= nil
+
+	l.tomonitor<- msg
+	return nil
+    } else {
+	return errors.New("flush-to filename not set")
+    }
 }
 
 //
@@ -482,29 +491,29 @@ func (l HistLog) Flush() (err error) {
 // the given writable stream.
 //
 func (l HistLog) Write(w io.Writer) (err error) {
-    if l.closed == false {
-	var msg		monmsg
-	var fetcheddata	string
-
-	msg.mtype		= mTypeGet
-	msg.count		= Count_t(0)
-	msg.val			= Val_t(0)
-	msg.strparam		= &fetcheddata
-
-	l.tomonitor<- msg
-	//
-	// We go into a loop of sleeping and waiting, till the monitor
-	// goroutine gets us the data we are waiting for and loads it
-	// into the string which we've passed by reference.
-	//
-	for len(*msg.strparam) == 0 {
-	    time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second)
-	}
-	time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second) // for good measure
-
-	_, err := w.Write([]byte(*msg.strparam))
-	return err
+    if l.closed {
+	return errors.New("Log object is closed for business")
     }
-    return nil
+    var msg		monmsg
+    var fetcheddata	string
+
+    msg.mtype		= mTypeGet
+    msg.count		= Count_t(0)
+    msg.val			= Val_t(0)
+    msg.strparam		= &fetcheddata
+
+    l.tomonitor<- msg
+    //
+    // We go into a loop of sleeping and waiting, till the monitor
+    // goroutine gets us the data we are waiting for and loads it
+    // into the string which we've passed by reference.
+    //
+    for len(*msg.strparam) == 0 {
+	time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second)
+    }
+    time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second) // for good measure
+
+    _, err = w.Write([]byte(*msg.strparam))
+    return err
 }
 
