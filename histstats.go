@@ -248,7 +248,7 @@ func monitor(l *HistLog) {
 		continue
 	    }
 	    doWrap(l)
-	    if (*l).pendingLogs > (*l).AutoFlush {
+	    if (*l).pendingLogs > (*l).Autoflush {
 		flushinternal(l)
 		(*l).pendingLogs = 0
 	    }
