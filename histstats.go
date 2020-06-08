@@ -193,43 +193,67 @@ func Read(io.Reader) (l *HistLog, err error) {
 
 //
 // The monitor function which runs in a separate goroutine and performs
-// all actual operations on the HistLog instance. One goroutine runs per
+// all actual operations on the HistLog instance. One goroutine operates per
 // active HistLog instance.
 //
 func monitor(l *HistLog) {
+    const MONITOR_EXIT_EMPTY_LOOPS int = -2	// needs to be -ve
+    var gotAnOrder	int
+
     for {
 	select {
 	case msg := <-(*l).tomonitor:
-	    if !((*l).closed) {
-		switch msg.mtype {
-		case mTypeFlush: {
-		    // do a json.marshall, then flush the string to file
+	    if ((*l).closed) {
+		gotAnOrder = 1
+		continue
+	    }
+	    switch msg.mtype {
+	    case mTypeFlush: {
+		// do a json.marshall, then flush the string to file
+	    }
+	    case mTypeIncr: {
+		loginternal(l, msg.count, Val_t(0))
+	    }
+	    case mTypeLog: {
+		loginternal(l, msg.count, msg.val)
+	    }
+	    case mTypeSetFlushFile: {
+		if (msg.strparam != nil) && ((*msg.strparam) != "") {
+		    (*l).storePath = (*msg.strparam)
+		} else {
+		    panic("call to SetFlushFile with empty flush filename")
 		}
-		case mTypeIncr: {
-		    loginternal(l, msg.count, Val_t(0))
-		}
-		case mTypeLog: {
-		    loginternal(l, msg.count, msg.val)
-		}
-		case mTypeSetFlushFile: {
-		    if (msg.strparam != nil) && ((*msg.strparam) != "") {
-			(*l).storePath = (*msg.strparam)
-		    } else {
-			panic("call to SetFlushFile with empty flush filename")
-		    }
-		}
-		case mTypeGet:
-		case mTypeSet:
-		case mTypeClose:
-		    (*l).closed = true
-		}
+	    }
+	    case mTypeGet:
+	    case mTypeSet:
+	    case mTypeClose:
+		flushinternal(l)
+		(*l).closed = true
+		(*l).Logs	= nil	// free up space
 	    }
 	case <-time.After(time.Minute):
-	    if !((*l).closed) {
-		doWrap(l)
+	    if ((*l).closed) {
+		gotAnOrder--
+		//
+		// if the HistLog instance is closed and we've run
+		// through a few empty loops just marking the minutes, we
+		// know that all the client threads which may have been
+		// queueing messages in the channel are now done, and no
+		// new messages will be coming in. So we can exit the
+		// goroutine safely.
+		//
+		if gotAnOrder <  MONITOR_EXIT_EMPTY_LOOPS {
+		    return
+		}
+		continue
 	    }
-	}
-    }
+	    doWrap(l)
+	    if (*l).pendingLogs > (*l).AutoFlush {
+		flushinternal(l)
+		(*l).pendingLogs = 0
+	    }
+	} // select
+    } // infinite for loop
 }
 
 //
@@ -398,6 +422,13 @@ func loginternal(l *HistLog, count Count_t, val Val_t) {
     thisentry.Elabel	= onelabel
 
     (*l).Logs = append((*l).Logs, thisentry)
+    (*l).pendingLogs++
+}
+
+//
+// Internal function to flush an instance to disk
+//
+func flushinternal(l *HistLog) {
 }
 
 //
@@ -405,7 +436,7 @@ func loginternal(l *HistLog, count Count_t, val Val_t) {
 //
 func (l HistLog) Log(c Count_t, v Val_t) (error) {
     if l.closed {
-	return errors.New("Log object is closed for business")
+	return errors.New("HistLog object is closed for business")
     }
     var msg monmsg
 
@@ -424,7 +455,7 @@ func (l HistLog) Log(c Count_t, v Val_t) (error) {
 //
 func (l HistLog) IncrBy(c Count_t) (error) {
     if l.closed {
-	return errors.New("Log object is closed for business")
+	return errors.New("HistLog object is closed for business")
     }
     var msg monmsg
 
@@ -442,7 +473,7 @@ func (l HistLog) IncrBy(c Count_t) (error) {
 //
 func (l HistLog) SetFlushFile(flushtofilename string) (error) {
     if l.closed {
-	return errors.New("Log object is closed for business")
+	return errors.New("HistLog object is closed for business")
     }
     var somebytes = []byte{'a','b','c'}
 
@@ -469,7 +500,7 @@ func (l HistLog) SetFlushFile(flushtofilename string) (error) {
 //
 func (l HistLog) Flush() (err error) {
     if l.closed {
-	return errors.New("Log object is closed for business")
+	return errors.New("HistLog object is closed for business")
     }
     if l.storePath != "" {
 	var msg	monmsg
@@ -492,15 +523,15 @@ func (l HistLog) Flush() (err error) {
 //
 func (l HistLog) Write(w io.Writer) (err error) {
     if l.closed {
-	return errors.New("Log object is closed for business")
+	return errors.New("HistLog object is closed for business")
     }
     var msg		monmsg
     var fetcheddata	string
 
     msg.mtype		= mTypeGet
     msg.count		= Count_t(0)
-    msg.val			= Val_t(0)
-    msg.strparam		= &fetcheddata
+    msg.val		= Val_t(0)
+    msg.strparam	= &fetcheddata
 
     l.tomonitor<- msg
     //
@@ -517,3 +548,25 @@ func (l HistLog) Write(w io.Writer) (err error) {
     return err
 }
 
+//
+// Close an object. Declare that it will no longer be in use. If the
+// flush-to filename is set, then this will cause a final flush
+// operation. If this is not set, then you will lose all entries since
+// the last Write() or Flush().
+//
+// Multiple calls to Close() will not trigger any error. The first one
+// will do the closing, the rest will just return quietly.
+//
+func (l HistLog) Close() {
+    if l.closed {
+	return
+    }
+    var msg		monmsg
+
+    msg.mtype		= mTypeClose
+    msg.count		= Count_t(0)
+    msg.val		= Val_t(0)
+    msg.strparam	= nil
+
+    l.tomonitor<- msg
+}
