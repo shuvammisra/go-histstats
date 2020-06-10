@@ -788,4 +788,4 @@ func (l *HistLog) Close() {
 
     l.tomonitor<- msg
     log.Println("Close: DEBUG: done")
-} // end Close()
+} // end Close(xxx)
