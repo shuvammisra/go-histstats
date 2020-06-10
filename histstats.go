@@ -110,6 +110,7 @@ type HistLog struct {
     Club2mins	bool	// true ==> club current readings at minute boundaries, track individual minutes
 			// false ==> club them at hour boundaries,
     closed	bool	// set to true after a Close() is called on the object
+    monitorexitat  time.Time	// when did the monitor exit?
     tomonitor	chan monmsg
 }
 
@@ -151,6 +152,7 @@ func monitor(l *HistLog) {
     const MONITOR_EXIT_EMPTY_LOOPS int = -2	// needs to be -ve
     var gotAnOrder	int
 
+    log.Println("monitor: DEBUG: started")
     for {
 	select {
 	case msg := <-(*l).tomonitor:
@@ -159,32 +161,33 @@ func monitor(l *HistLog) {
 		continue
 	    }
 	    switch msg.mtype {
-	    case mTypeFlush: {
-		// we've reached here means the flush-to filename has
-		// been set already
-		flushinternal(l)
-	    }
-	    case mTypeIncr: {
-		loginternal(l, msg.count, Val_t(0))
-	    }
-	    case mTypeLog: {
-		loginternal(l, msg.count, msg.val)
-	    }
-	    case mTypeSetFlushFile: {
-		if (msg.strparam != nil) && ((*msg.strparam) != "") {
-		    (*l).storePath = (*msg.strparam)
-		} else {
-		    panic("call to SetFlushFile with empty flush filename")
+		case mTypeFlush: {
+		    // we've reached here means the flush-to filename has
+		    // been set already
+		    flushinternal(l)
 		}
-	    }
-	    case mTypeGet:
-	    case mTypeSet:
-	    case mTypeClose:
-		flushinternal(l)
-		(*l).closed = true
-		(*l).Logs	= nil	// free up space
+		case mTypeIncr: {
+		    loginternal(l, msg.count, Val_t(0))
+		}
+		case mTypeLog: {
+		    loginternal(l, msg.count, msg.val)
+		}
+		case mTypeSetFlushFile: {
+		    if (msg.strparam != nil) && ((*msg.strparam) != "") {
+			(*l).storePath = (*msg.strparam)
+		    } else {
+			panic("call to SetFlushFile with empty flush filename")
+		    }
+		}
+		case mTypeGet:
+		case mTypeSet:
+		case mTypeClose:
+		    flushinternal(l)
+		    (*l).closed = true
+		    (*l).Logs	= nil	// free up space
 	    }
 	case <-time.After(time.Minute):
+	    log.Println("monitor: DEBUG: timer wakeup")
 	    if ((*l).closed) {
 		gotAnOrder--
 		//
@@ -196,14 +199,16 @@ func monitor(l *HistLog) {
 		// goroutine safely.
 		//
 		if gotAnOrder <  MONITOR_EXIT_EMPTY_LOOPS {
+		    log.Println("monitor: INFO: terminating")
+		    (*l).monitorexitat = time.Now()
 		    return
 		}
 		continue
 	    }
 	    doWrap(l)
-	    if (*l).pendingLogs > (*l).Autoflush {
+	    if ((*l).pendingLogs > (*l).Autoflush) && ((*l).Autoflush > 0) {
 		flushinternal(l)
-		(*l).pendingLogs = 0
+		log.Println("monitor: INFO: did auto-flush")
 	    }
 	} // select
     } // infinite for loop
@@ -226,6 +231,7 @@ func doWrap(lptr *HistLog) {
 	// if time has indeed moved backwards, we will just do nothing in
 	// each call to doWrap(), and bide our time till time once again
 	// moves forward, i.e. current system time is "after" l.lastChecked
+	log.Println("doWrap: INFO: now is before lastChecked")
 	return
     }
 
@@ -271,6 +277,7 @@ func doWrap(lptr *HistLog) {
 	    wraptype = etypeMinute
 	}
     }
+    log.Println("doWrap: DEBUG: wraptype =", wraptype)
 
 
     if wraptype >= etypeMinute {
@@ -316,6 +323,7 @@ func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entryType_t) {
 	lastyr, acertainmonth, lastdate = (*lptr).lastChecked.Date()
 	lastmth = int(acertainmonth)
     }
+    log.Println("logEntryCollapse: DEBUG: from", wrapfrom, "to", collapseto)
 
     if !(*lptr).Day2Month {
 	lastyr, lastweek = (*lptr).lastChecked.ISOWeek()
@@ -397,6 +405,9 @@ func flushinternal(l *HistLog) {
         log.Println("flushinternal: WriteFile:", e)
         return
     }
+    (*l).pendingLogs = 0
+    log.Println("flushinternal: DEBUG: flushed to", (*l).storePath)
+    return
 }
 
 //
@@ -416,6 +427,7 @@ func json2HLLElabel(elabeldata []interface{}) (*entryLabel_t) {
 	    return nil
 	}
     }
+    log.Println("json2HLLElabel: DEBUG: returning [", el, "]")
     return &el
 }
 
@@ -432,7 +444,13 @@ func json2HLlogs(logsslice []interface{}) (*[]histlogentry) {
 	for k2, v2 := range jsonentry {
 	    switch strings.ToLower(k2) {
 		case "elabel": {
-		    HLentry.Elabel = *(json2HLLElabel(v2.([]interface{})))
+		    if elabelptr:=json2HLLElabel(v2.([]interface{}));
+			    elabelptr == nil {
+			log.Println("json2HLlogs: could not get valid Elabel, exiting")
+			return nil
+		    } else {
+			HLentry.Elabel = *elabelptr
+		    }
 		}
 		case "type":
 		    HLentry.T = entryType_t(int(math.Round(v2.(float64))))
@@ -446,6 +464,8 @@ func json2HLlogs(logsslice []interface{}) (*[]histlogentry) {
 	}
 	HLlogs = append(HLlogs, HLentry)
     }
+    log.Println("json2HLlogs: DEBUG: returning Logs with",
+		len(HLlogs),"elements")
     return &HLlogs
 }
 
@@ -456,7 +476,11 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
     for k, v := range onemap {
 	switch strings.ToLower(k) {
 	    case "logs": {
-		oneHL.Logs = *(json2HLlogs(v.([]interface{})))
+		if oneHL.Logs = *(json2HLlogs(v.([]interface{})));
+			oneHL.Logs == nil {
+		    log.Println("json2HL: could not get valid Logs slice, exiting")
+		    return nil, errors.New("No valid Logs[] found")
+		}
 	    }
 	    case "day2month": {
 		switch strings.ToLower(v.(string)) {
@@ -491,17 +515,20 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
 	    }
 	    default: {
 		log.Println("json2HL: [",k,"] is not valid field for HistLog")
+		// we will not exit, we will keep looping
 	    }
 	} // end switch
     } // end for
 
-    oneHL.lastChecked = time.Now()
-    oneHL.pendingLogs = 0
-    oneHL.storePath = ""
-    oneHL.closed = false
-    oneHL.tomonitor = make(chan monmsg, MONITOR_CHANNEL_DEPTH)
+    oneHL.lastChecked		= time.Now()
+    oneHL.pendingLogs		= 0
+    oneHL.storePath		= ""
+    oneHL.closed		= false
+    oneHL.monitorexitat		= time.Time{}
+    oneHL.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
     go monitor(&oneHL)
 
+    log.Println("json2HL: DEBUG: returning with success")
     return &oneHL, nil
 } // end json2HL()
 
@@ -537,6 +564,7 @@ func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
     l.Autoflush		= af
     l.Club2mins		= club2mins
     l.closed		= false
+    l.monitorexitat	= time.Time{}
     l.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
 
     go monitor(&l)
@@ -554,11 +582,13 @@ func Load(filename string) (*HistLog, error) {
 
     filedata, err = ioutil.ReadFile(filename)
     if err != nil {
-	return &oneHL, err
+	log.Println("Load: ReadFile:", err)
+	return nil, err
     }
 
     if e := json.Unmarshal(filedata, &oneHL); e != nil {
-	return &oneHL, e
+	log.Println("Load: Unmarshal:", err)
+	return nil, e
     }
 
     // We now fill in the fields which are not loaded and stored, and
@@ -567,10 +597,13 @@ func Load(filename string) (*HistLog, error) {
     oneHL.storePath		= filename
     oneHL.pendingLogs		= 0		// not needed, strictly
     oneHL.closed		= false
+    oneHL.monitorexitat		= time.Time{}
     oneHL.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
 
     go monitor(&oneHL)
 
+    log.Println("Load: DEBUG: loaded from", filename,
+		"and returning with success")
     return &oneHL, nil
 }
 
@@ -601,6 +634,7 @@ func Read(r io.Reader) (*HistLog, error) {
 	}
 	oneHL, e = json2HL(&jsonblob)
     }
+    log.Println("Read: DEBUG: returning with success")
     return oneHL, e
 }
 
@@ -608,8 +642,8 @@ func Read(r io.Reader) (*HistLog, error) {
 //
 // Exported method to add a new entry to a HistLog instance.
 //
-func (l HistLog) Log(c Count_t, v Val_t) (error) {
-    if l.closed {
+func (l *HistLog) Log(c Count_t, v Val_t) (error) {
+    if (*l).closed {
 	return errors.New("HistLog object is closed for business")
     }
     var msg monmsg
@@ -619,7 +653,7 @@ func (l HistLog) Log(c Count_t, v Val_t) (error) {
     msg.val		= v
     msg.strparam	= nil
 
-    l.tomonitor <-msg
+    (*l).tomonitor <-msg
     return nil
 }
 
@@ -627,8 +661,8 @@ func (l HistLog) Log(c Count_t, v Val_t) (error) {
 // Exported method to add a new entry to a HistLog instance with just an
 // increment of the count
 //
-func (l HistLog) Incr(c Count_t) (error) {
-    if l.closed {
+func (l *HistLog) Incr(c Count_t) (error) {
+    if (*l).closed {
 	return errors.New("HistLog object is closed for business")
     }
     var msg monmsg
@@ -638,24 +672,28 @@ func (l HistLog) Incr(c Count_t) (error) {
     msg.val		= Val_t(0)
     msg.strparam	= nil
 
-    l.tomonitor <-msg
+    (*l).tomonitor <-msg
     return nil
 }
 
 //
 // Set the flush-to filename.
 //
-func (l HistLog) SetFlushFile(flushtofilename string) (error) {
-    if l.closed {
+func (l *HistLog) SetFlushFile(flushtofilename string) (error) {
+    if (*l).closed {
 	return errors.New("HistLog object is closed for business")
     }
     var somebytes = []byte{'a','b','c'}
 
     // do a trial write to the filename given
     if e := ioutil.WriteFile(flushtofilename, somebytes, 0660); e != nil {
+	log.Println("SetFlushFile: WriteFile test for", flushtofilename,
+			"failed")
 	return e
     }
     if e := os.Remove(flushtofilename); e != nil {
+	log.Println("SetFlushFile: file deletion for", flushtofilename,
+			"failed")
 	return e
     }
     var msg monmsg
@@ -663,62 +701,68 @@ func (l HistLog) SetFlushFile(flushtofilename string) (error) {
     msg.mtype		= mTypeSetFlushFile
     msg.count		= Count_t(0)
     msg.val		= Val_t(0)
-    *msg.strparam	= flushtofilename
+    msg.strparam	= &flushtofilename
 
-    l.tomonitor<- msg
+    (*l).tomonitor <-msg
     return nil
 }
 
 //
 // Do an explicit flush of the HistLog to its pre-set flush-to file
 //
-func (l HistLog) Flush() (err error) {
-    if l.closed {
+func (l *HistLog) Flush() (err error) {
+    if (*l).closed {
 	return errors.New("HistLog object is closed for business")
     }
-    if l.storePath != "" {
-	var msg	monmsg
-
-	msg.mtype	= mTypeFlush
-	msg.count	= Count_t(0)
-	msg.val		= Val_t(0)
-	msg.strparam	= nil
-
-	l.tomonitor<- msg
-	return nil
-    } else {
+    if (*l).storePath == "" {
 	return errors.New("flush-to filename not set")
     }
+    var msg	monmsg
+
+    msg.mtype		= mTypeFlush
+    msg.count		= Count_t(0)
+    msg.val		= Val_t(0)
+    msg.strparam	= nil
+
+    (*l).tomonitor<- msg
+    return nil
 }
 
 //
 // Write out a nicely formatted representation of the HistLog object to
 // the given writable stream.
 //
-func (l HistLog) Write(w io.Writer) (err error) {
-    if l.closed {
+func (l *HistLog) Write(w io.Writer) (err error) {
+    if (*l).closed {
 	return errors.New("HistLog object is closed for business")
     }
     var msg		monmsg
     var fetcheddata	string
+    var c		int
+    const C_MAX		int = 10	// prevent infinite loops
 
     msg.mtype		= mTypeGet
     msg.count		= Count_t(0)
     msg.val		= Val_t(0)
     msg.strparam	= &fetcheddata
 
-    l.tomonitor<- msg
+    (*l).tomonitor<- msg
     //
     // We go into a loop of sleeping and waiting, till the monitor
     // goroutine gets us the data we are waiting for and loads it
     // into the string which we've passed by reference.
     //
-    for len(*msg.strparam) == 0 {
+    for c=0; (len(*msg.strparam) == 0) && (c<C_MAX); c++ {
 	time.Sleep(time.Duration(datafetch_SLEEP_SEC) * time.Second)
+    }
+    if c ==  C_MAX {
+	log.Println("Write: data-fetch loop seems stuck forever")
+	return errors.New("data-fetch loop timed out")
     }
     time.Sleep(time.Duration(datafetch_SLEEP_SEC) * time.Second) // for good measure
 
     _, err = w.Write([]byte(*msg.strparam))
+    log.Println("Write: DEBUG: done, err =",err)
     return err
 }
 
@@ -731,8 +775,8 @@ func (l HistLog) Write(w io.Writer) (err error) {
 // Multiple calls to Close() will not trigger any error. The first one
 // will do the closing, the rest will just return quietly.
 //
-func (l HistLog) Close() {
-    if l.closed {
+func (l *HistLog) Close() {
+    if (*l).closed {
 	return
     }
     var msg		monmsg
@@ -743,4 +787,5 @@ func (l HistLog) Close() {
     msg.strparam	= nil
 
     l.tomonitor<- msg
-}
+    log.Println("Close: DEBUG: done")
+} // end Close()
