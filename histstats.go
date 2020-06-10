@@ -47,26 +47,27 @@
 package histstats
 
 import (
-   // "fmt"
     "os"
     "io"
     "io/ioutil"
     "time"
     "errors"
-    // "sync"
-//    "encoding/json"
+    "math"
+    "log"
+    "encoding/json"
+    "strings"
 )
 
 const (
     MONITOR_CHANNEL_DEPTH int	= 10	// increase and re-compile if needed
-    DATAFETCH_SLEEP_SEC	  int	= 2
+    datafetch_SLEEP_SEC	  int	= 2
 )
 
 // Each log entry in the HistLog set will have a type, which will be one
 // of these types
-type entrytype int
+type entryType_t int
 const (
-    etypeRaw		entrytype = iota
+    etypeRaw		entryType_t = iota
     etypeMinute
     etypeHour
     etypeDay
@@ -75,12 +76,19 @@ const (
     etypeYear
 )
 
-type Count_t	int64
-type Val_t	int64
-type entryLabel_t	[5]int16
+type Count_t		int64
+type Val_t		int64
+type entryLabel_t	[5]int16	// yr, mth/wk, date, hr, min
+const (
+    elidxYR		int = iota	// the year number
+    elidxMTHWK				// the month or week number
+    elidxDATE				// the date number
+    elidxHR				// the hour number
+    elidxMIN				// the minute number
+)
 
 type histlogentry struct {
-    T		entrytype	`json:"type"`
+    T		entryType_t	`json:"type"`
     Elabel	entryLabel_t	// "entry label", telling you which time slice this reading is for
     Count	Count_t
     Val		Val_t
@@ -106,7 +114,7 @@ type HistLog struct {
 }
 
 //
-// Message types for messages sent to the monitor daemon thread
+// Message types for messages sent to the monitor goroutine
 //
 type mTypes	int
 const (
@@ -133,63 +141,6 @@ type monmsg struct {
 }
 
 
-//
-// Called when you want to create a new HistLog instance from scratch
-//
-//	d2m: true means you want days to collapse to months, false
-//		means days collapse to weeks, and 52 weeks a year
-//	weekstart: set it to Sunday, Monday or Friday to decide when
-//		to collapse days into a week. Only relevant if d2m == false
-//	agelimit: set it to a small integer to decide how many years of
-//		data to remember
-//	af: nil means no auto-flush, an integer means auto-flush after
-//		that many Log() or Incr() calls
-//	club2mins: false means you are not interested in minute-level
-//		data for the last hour, true means you want current
-//		readings to be clubbed into minutes at minute boundaries
-//		first, then those minutes get clubbed into hours at hour
-//		boundaries
-//
-func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
-	club2mins bool) (l HistLog) {
-    l.lastChecked	= time.Now()
-    l.Logs		= make([]histlogentry, 20)
-    l.Day2Month		= d2m
-    l.Weekstart		= weekstart
-    l.Agelimit		= agelimit
-//    l.storePath		= nil
-    l.pendingLogs	= 0
-    l.Autoflush		= af
-    l.Club2mins		= club2mins
-    l.closed		= false
-    l.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
-
-    return l
-}
-
-//
-// Called to instantiate and load a HistLog from its backing store (a file);
-// this file name is remembered for later Flush() calls
-//
-func Load(filename string) (l *HistLog, err error) {
-    return l, err
-}
-
-//
-// Called to instantiate and read a HistLog object from any I/O endpoint.
-// A HistLog instance created by Read() does not have its flush-store
-// filename set, so calls to Flush() will fail unless you set the
-// filename by making a call to SetFlushFile() first
-//
-// Why does Load() set the flush-to filename of the instance created, but 
-// Read() does not? Because Load() takes a filename on disk as parameter 
-// to load from, whereas Read() is more generic and reads from any readable 
-// stream endpoint.
-//
-func Read(io.Reader) (l *HistLog, err error) {
-    return l, err
-}
-
 
 //
 // The monitor function which runs in a separate goroutine and performs
@@ -209,7 +160,9 @@ func monitor(l *HistLog) {
 	    }
 	    switch msg.mtype {
 	    case mTypeFlush: {
-		// do a json.marshall, then flush the string to file
+		// we've reached here means the flush-to filename has
+		// been set already
+		flushinternal(l)
 	    }
 	    case mTypeIncr: {
 		loginternal(l, msg.count, Val_t(0))
@@ -254,7 +207,7 @@ func monitor(l *HistLog) {
 	    }
 	} // select
     } // infinite for loop
-}
+} // end monitor()
 
 //
 // This critical internal function detects if there has been any wrapping
@@ -293,7 +246,7 @@ func doWrap(lptr *HistLog) {
     }
     nowhr, nowmin, _     := t.Clock()
 
-    var wraptype entrytype
+    var wraptype entryType_t
 
     if nowyr > lastyr {		// the year has wrapped since last time
 	wraptype = etypeYear
@@ -352,7 +305,7 @@ func doWrap(lptr *HistLog) {
 // Collapses all the log entries of a specific type and replaces
 // them with a new entry of the next "fatter" type.
 //
-func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entrytype) {
+func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entryType_t) {
     var totalcount Count_t
     var totalvals  Val_t
     var thisentry histlogentry
@@ -382,11 +335,14 @@ func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entrytype) {
     thisentry.Val   = totalvals
     thisentry.T     = collapseto
 
-    onelabel := entryLabel_t{ int16(lastyr), int16(lastweek), int16(lastdate),
-	    int16(lasthr), int16(lastmin) }
+    onelabel := entryLabel_t{elidxYR: int16(lastyr),
+			elidxMTHWK: int16(lastweek),
+			elidxDATE: int16(lastdate),
+			elidxHR: int16(lasthr),
+			elidxMIN: int16(lastmin) }
     thisentry.Elabel = onelabel
     if (*lptr).Day2Month {
-	thisentry.Elabel[1] = int16(lastmth)
+	thisentry.Elabel[elidxMTHWK] = int16(lastmth)
     }
     (*lptr).Logs = append((*lptr).Logs, thisentry)
 } // end logEntryCollapse()
@@ -410,10 +366,13 @@ func loginternal(l *HistLog, count Count_t, val Val_t) {
 	nowyr, nowweek = now.ISOWeek()
 	nowdate = int(now.Weekday())
     }
-    onelabel := entryLabel_t{ int16(nowyr), int16(nowmth),
-		int16(nowdate), int16(nowhr), int16(nowmin) }
+    onelabel := entryLabel_t{elidxYR: int16(nowyr),
+			elidxMTHWK: int16(nowmth),
+			elidxDATE: int16(nowdate),
+			elidxHR: int16(nowhr),
+			elidxMIN: int16(nowmin) }
     if !(*l).Day2Month {
-	onelabel[1] = int16(nowweek)
+	onelabel[elidxMTHWK] = int16(nowweek)
     }
 
     thisentry.T		= etypeRaw
@@ -423,13 +382,228 @@ func loginternal(l *HistLog, count Count_t, val Val_t) {
 
     (*l).Logs = append((*l).Logs, thisentry)
     (*l).pendingLogs++
-}
+} // end loginternal()
 
 //
 // Internal function to flush an instance to disk
 //
 func flushinternal(l *HistLog) {
+    jsonHL, err := json.MarshalIndent(*l, "", "    ")
+    if err != nil {
+        log.Println("flushinternal: MarshalIndent:", err)
+        return
+    }
+    if e:=ioutil.WriteFile((*l).storePath, jsonHL, 0660); e!= nil {
+        log.Println("flushinternal: WriteFile:", e)
+        return
+    }
 }
+
+//
+// scans the entries in a JSON-derived slice of Elabel data (which is
+// essentially an array of five integers) and loads it into a
+// entryLabel_t instance and returns it
+//
+func json2HLLElabel(elabeldata []interface{}) (*entryLabel_t) {
+    var el entryLabel_t
+
+    if len(elabeldata) > len(el) {
+	return nil
+    }
+    for k, v := range elabeldata {
+	if el[k] = int16(math.Round(v.(float64))); el[k] < 0 {
+	    log.Println("json2HLLElabel: -ve label value: el[",k,"] =", el[k])
+	    return nil
+	}
+    }
+    return &el
+}
+
+//
+// scans entries in a JSON-derived slice of histlogentry data and loads
+// this data into a slice of actual histlogentries and returns it
+//
+func json2HLlogs(logsslice []interface{}) (*[]histlogentry) {
+    var HLlogs	[]histlogentry = make([]histlogentry, 0)
+    var HLentry histlogentry
+
+    for _, v := range logsslice {
+	jsonentry := v.(map[string]interface{})
+	for k2, v2 := range jsonentry {
+	    switch strings.ToLower(k2) {
+		case "elabel": {
+		    HLentry.Elabel = *(json2HLLElabel(v2.([]interface{})))
+		}
+		case "type":
+		    HLentry.T = entryType_t(int(math.Round(v2.(float64))))
+		case "count":
+		    HLentry.Count = Count_t(int(math.Round(v2.(float64))))
+		case "val":
+		    HLentry.Val = Val_t(int(math.Round(v2.(float64))))
+		default:
+		    log.Println("json2HLlogs: [",k2,"] is not valid field for histlogentry")
+	    }
+	}
+	HLlogs = append(HLlogs, HLentry)
+    }
+    return &HLlogs
+}
+
+func json2HL(jsonblob *interface{}) (*HistLog, error) {
+    var oneHL	HistLog
+
+    onemap := (*jsonblob).(map[string]interface{})
+    for k, v := range onemap {
+	switch strings.ToLower(k) {
+	    case "logs": {
+		oneHL.Logs = *(json2HLlogs(v.([]interface{})))
+	    }
+	    case "day2month": {
+		switch strings.ToLower(v.(string)) {
+		    case "true": oneHL.Day2Month = true
+		    case "false": oneHL.Day2Month = false
+		    default: {
+			log.Println("json2HL: value [", v.(string),
+				"] not valid for Day2Month")
+			return nil, errors.New("Invalid value: Day2Month")
+		    }
+		}
+	    }
+	    case "weekstart": {
+		oneHL.Weekstart = time.Weekday(int(math.Round(v.(float64))))
+	    }
+	    case "agelimit": {
+		oneHL.Agelimit = int(math.Round(v.(float64)))
+	    }
+	    case "autoflush": {
+		oneHL.Autoflush = int(math.Round(v.(float64)))
+	    }
+	    case "club2mins": {
+		switch strings.ToLower(v.(string)) {
+		    case "true": oneHL.Club2mins = true
+		    case "false": oneHL.Club2mins = false
+		    default: {
+			log.Println("json2HL: value [", v.(string),
+				"] not valid for Club2mins")
+			return nil, errors.New("Invalid value: Club2mins")
+		    }
+		}
+	    }
+	    default: {
+		log.Println("json2HL: [",k,"] is not valid field for HistLog")
+	    }
+	} // end switch
+    } // end for
+
+    oneHL.lastChecked = time.Now()
+    oneHL.pendingLogs = 0
+    oneHL.storePath = ""
+    oneHL.closed = false
+    oneHL.tomonitor = make(chan monmsg, MONITOR_CHANNEL_DEPTH)
+    go monitor(&oneHL)
+
+    return &oneHL, nil
+} // end json2HL()
+
+//
+// PUBLIC METHODS AND FUNCTIONS
+//
+
+//
+// Called when you want to create a new HistLog instance from scratch
+//
+//	d2m: true means you want days to collapse to months, false
+//		means days collapse to weeks, and 52 weeks a year
+//	weekstart: set it to Sunday, Monday or Friday to decide when
+//		to collapse days into a week. Only relevant if d2m == false
+//	agelimit: set it to a small integer to decide how many years of
+//		data to remember
+//	af: nil means no auto-flush, an integer means auto-flush after
+//		that many Log() or Incr() calls
+//	club2mins: false means you are not interested in minute-level
+//		data for the last hour, true means you want current
+//		readings to be clubbed into minutes at minute boundaries
+//		first, then those minutes get clubbed into hours at hour
+//		boundaries
+//
+func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
+	club2mins bool) (l HistLog) {
+    l.lastChecked	= time.Now()
+    l.Logs		= make([]histlogentry, 0, 20)
+    l.Day2Month		= d2m
+    l.Weekstart		= weekstart
+    l.Agelimit		= agelimit
+    l.pendingLogs	= 0
+    l.Autoflush		= af
+    l.Club2mins		= club2mins
+    l.closed		= false
+    l.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
+
+    go monitor(&l)
+    return l
+}
+
+//
+// Called to instantiate and load a HistLog from its backing store (a file);
+// this file name is remembered for later Flush() calls
+//
+func Load(filename string) (*HistLog, error) {
+    var oneHL		HistLog
+    var filedata	[]byte
+    var err		error
+
+    filedata, err = ioutil.ReadFile(filename)
+    if err != nil {
+	return &oneHL, err
+    }
+
+    if e := json.Unmarshal(filedata, &oneHL); e != nil {
+	return &oneHL, e
+    }
+
+    // We now fill in the fields which are not loaded and stored, and
+    // carry private content
+    oneHL.lastChecked		= time.Now()
+    oneHL.storePath		= filename
+    oneHL.pendingLogs		= 0		// not needed, strictly
+    oneHL.closed		= false
+    oneHL.tomonitor		= make(chan monmsg, MONITOR_CHANNEL_DEPTH)
+
+    go monitor(&oneHL)
+
+    return &oneHL, nil
+}
+
+//
+// Called to instantiate and read a HistLog object from any I/O endpoint.
+// A HistLog instance created by Read() does not have its flush-store
+// filename set, so calls to Flush() will fail unless you set the
+// filename by making a call to SetFlushFile() first
+//
+// Why does Load() set the flush-to filename of the instance created, but 
+// Read() does not? Because Load() takes a filename on disk as parameter 
+// to load from, whereas Read() is more generic and reads from any readable 
+// stream endpoint.
+//
+func Read(r io.Reader) (*HistLog, error) {
+    var oneHL	*HistLog
+    var e	error
+
+    dec := json.NewDecoder(r)
+    var jsonblob	interface{}	// this means "it holds anything"
+
+    for {
+	if e := dec.Decode(&jsonblob); e == io.EOF {
+	    break
+	} else if e != nil {
+	    log.Println("Read: Decoding failed:", e)
+	    return nil, e
+	}
+	oneHL, e = json2HL(&jsonblob)
+    }
+    return oneHL, e
+}
+
 
 //
 // Exported method to add a new entry to a HistLog instance.
@@ -453,7 +627,7 @@ func (l HistLog) Log(c Count_t, v Val_t) (error) {
 // Exported method to add a new entry to a HistLog instance with just an
 // increment of the count
 //
-func (l HistLog) IncrBy(c Count_t) (error) {
+func (l HistLog) Incr(c Count_t) (error) {
     if l.closed {
 	return errors.New("HistLog object is closed for business")
     }
@@ -505,8 +679,8 @@ func (l HistLog) Flush() (err error) {
     if l.storePath != "" {
 	var msg	monmsg
 
-	msg.mtype		= mTypeFlush
-	msg.count		= Count_t(0)
+	msg.mtype	= mTypeFlush
+	msg.count	= Count_t(0)
 	msg.val		= Val_t(0)
 	msg.strparam	= nil
 
@@ -540,9 +714,9 @@ func (l HistLog) Write(w io.Writer) (err error) {
     // into the string which we've passed by reference.
     //
     for len(*msg.strparam) == 0 {
-	time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second)
+	time.Sleep(time.Duration(datafetch_SLEEP_SEC) * time.Second)
     }
-    time.Sleep(time.Duration(DATAFETCH_SLEEP_SEC) * time.Second) // for good measure
+    time.Sleep(time.Duration(datafetch_SLEEP_SEC) * time.Second) // for good measure
 
     _, err = w.Write([]byte(*msg.strparam))
     return err
