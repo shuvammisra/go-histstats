@@ -221,12 +221,12 @@ func monitor(l *HistLog) {
 // which need collapsing. This is the heart of the package. If this works
 // correctly, Covid19 lockdowns are a pot of payasam.
 //
-func doWrap(lptr *HistLog) {
+func doWrap(l *HistLog) {
 
     // very critical check to see if time has moved backwards, as often
     // happens with system clock being reset or timezone changes. We work
     // with local time, which can move back and forth.
-    if time.Now().Sub((*lptr).lastChecked) < 0 {
+    if time.Now().Sub((*l).lastChecked) < 0 {
 
 	// if time has indeed moved backwards, we will just do nothing in
 	// each call to doWrap(), and bide our time till time once again
@@ -236,17 +236,17 @@ func doWrap(lptr *HistLog) {
     }
 
     t := time.Now()
-    lastyr, lastmth, lastdate := (*lptr).lastChecked.Date()
+    lastyr, lastmth, lastdate := (*l).lastChecked.Date()
     var lastweek	int
-    if !(*lptr).Day2Month {
-	lastyr, lastweek = (*lptr).lastChecked.ISOWeek()
-	lastdate = int((*lptr).lastChecked.Weekday())
+    if !(*l).Day2Month {
+	lastyr, lastweek = (*l).lastChecked.ISOWeek()
+	lastdate = int((*l).lastChecked.Weekday())
     }
-    lasthr, lastmin, _  := (*lptr).lastChecked.Clock()
+    lasthr, lastmin, _  := (*l).lastChecked.Clock()
 
     nowyr, nowmth, nowdate    := t.Date()
     var nowweek		int
-    if !(*lptr).Day2Month {
+    if !(*l).Day2Month {
 	nowyr, nowweek = t.ISOWeek()
 	nowdate = int(t.Weekday())
     }
@@ -256,7 +256,7 @@ func doWrap(lptr *HistLog) {
 
     if nowyr > lastyr {		// the year has wrapped since last time
 	wraptype = etypeYear
-    } else if (*lptr).Day2Month {
+    } else if (*l).Day2Month {
 	if nowmth > lastmth {
 	    wraptype = etypeMonth
 	} else if nowdate > lastdate {
@@ -281,61 +281,70 @@ func doWrap(lptr *HistLog) {
 
 
     if wraptype >= etypeMinute {
-	logEntryCollapse(lptr, etypeRaw, etypeMinute)
+	logEntryCollapse(l, etypeRaw, etypeMinute)
     }
     if wraptype >= etypeHour {
-	logEntryCollapse(lptr, etypeMinute, etypeHour)
+	logEntryCollapse(l, etypeMinute, etypeHour)
     }
     if wraptype >= etypeDay {
-	logEntryCollapse(lptr, etypeHour, etypeDay)
+	logEntryCollapse(l, etypeHour, etypeDay)
     }
-    if (*lptr).Day2Month {
+    if (*l).Day2Month {
 	if wraptype >= etypeMonth {
-	    logEntryCollapse(lptr, etypeDay, etypeMonth)
+	    logEntryCollapse(l, etypeDay, etypeMonth)
 	    if wraptype >= etypeYear {
-		logEntryCollapse(lptr, etypeMonth, etypeYear)
+		logEntryCollapse(l, etypeMonth, etypeYear)
 	    }
 	}
     } else {
 	if wraptype >= etypeWeek {
-	    logEntryCollapse(lptr, etypeDay, etypeWeek)
+	    logEntryCollapse(l, etypeDay, etypeWeek)
 	    if wraptype >= etypeYear {
-		logEntryCollapse(lptr, etypeWeek, etypeYear)
+		logEntryCollapse(l, etypeWeek, etypeYear)
 	    }
 	}
     }
 
-    (*lptr).lastChecked = t
+    (*l).lastChecked = t
 }  // end doWrap()
 
 //
 // Collapses all the log entries of a specific type and replaces
 // them with a new entry of the next "fatter" type.
 //
-func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entryType_t) {
+func logEntryCollapse(l *HistLog, wrapfrom, collapseto entryType_t) {
     var totalcount Count_t
     var totalvals  Val_t
     var thisentry histlogentry
     var lastyr, lastmth, lastweek, lastdate, lasthr, lastmin	int
+    var newLogs []histlogentry = make([]histlogentry, 0)
 
     {
 	var acertainmonth time.Month
-	lastyr, acertainmonth, lastdate = (*lptr).lastChecked.Date()
+	lastyr, acertainmonth, lastdate = (*l).lastChecked.Date()
 	lastmth = int(acertainmonth)
     }
     log.Println("logEntryCollapse: DEBUG: from", wrapfrom, "to", collapseto)
 
-    if !(*lptr).Day2Month {
-	lastyr, lastweek = (*lptr).lastChecked.ISOWeek()
-	lastdate = int((*lptr).lastChecked.Weekday())
+    if !(*l).Day2Month {
+	lastyr, lastweek = (*l).lastChecked.ISOWeek()
+	lastdate = int((*l).lastChecked.Weekday())
     }
-    lasthr, lastmin, _  = (*lptr).lastChecked.Clock()
+    lasthr, lastmin, _  = (*l).lastChecked.Clock()
 
     // We aggregate all the lower-level entries...
-    for _, thisentry = range (*lptr).Logs {
+    for _, thisentry = range (*l).Logs {
 	if thisentry.T == wrapfrom {
 	    totalcount += thisentry.Count
 	    totalvals  += thisentry.Val
+	} else {
+	    //
+	    // Here we are eliminating all the entries which we are
+	    // collapsing, so that neLogs does not have them. We want
+	    // newLogs to hold only those entries which we want to carry
+	    // forward in the collapsed list.
+	    //
+	    newLogs = append(newLogs, thisentry)
 	}
     }
     // ... and create a new entry
@@ -349,10 +358,13 @@ func logEntryCollapse(lptr *HistLog, wrapfrom, collapseto entryType_t) {
 			elidxHR: int16(lasthr),
 			elidxMIN: int16(lastmin) }
     thisentry.Elabel = onelabel
-    if (*lptr).Day2Month {
+    if (*l).Day2Month {
 	thisentry.Elabel[elidxMTHWK] = int16(lastmth)
     }
-    (*lptr).Logs = append((*lptr).Logs, thisentry)
+    newLogs = append(newLogs, thisentry)
+    log.Printf("logEntryCollapse: DEBUG: old list =", len((*l).Logs),
+		"new list =", len(newLogs))
+    (*l).Logs = newLogs
 } // end logEntryCollapse()
 
 //
