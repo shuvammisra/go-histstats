@@ -200,7 +200,7 @@ func monitor(l *HistLog) {
 		//
 		if gotAnOrder <  MONITOR_EXIT_EMPTY_LOOPS {
 		    log.Println("monitor: INFO: terminating")
-		    (*l).monitorexitat = time.Now()
+		    (*l).monitorexitat = timeNow()
 		    return
 		}
 		continue
@@ -226,7 +226,7 @@ func doWrap(l *HistLog) {
     // very critical check to see if time has moved backwards, as often
     // happens with system clock being reset or timezone changes. We work
     // with local time, which can move back and forth.
-    if time.Now().Sub((*l).lastChecked) < 0 {
+    if timeNow().Sub((*l).lastChecked) < 0 {
 
 	// if time has indeed moved backwards, we will just do nothing in
 	// each call to doWrap(), and bide our time till time once again
@@ -235,7 +235,7 @@ func doWrap(l *HistLog) {
 	return
     }
 
-    t := time.Now()
+    t := timeNow()
     lastyr, lastmth, lastdate := (*l).lastChecked.Date()
     var lastweek	int
     if !(*l).Day2Month {
@@ -373,7 +373,7 @@ func logEntryCollapse(l *HistLog, wrapfrom, collapseto entryType_t) {
 //
 func loginternal(l *HistLog, count Count_t, val Val_t) {
     var thisentry	histlogentry
-    var now		time.Time = time.Now()
+    var now		time.Time = timeNow()
     var nowyr, nowmth, nowweek, nowdate, nowhr, nowmin	int
 
     {
@@ -532,7 +532,7 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
 	} // end switch
     } // end for
 
-    oneHL.lastChecked		= time.Now()
+    oneHL.lastChecked		= timeNow()
     oneHL.pendingLogs		= 0
     oneHL.storePath		= ""
     oneHL.closed		= false
@@ -567,7 +567,7 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
 //
 func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
 	club2mins bool) (l HistLog) {
-    l.lastChecked	= time.Now()
+    l.lastChecked	= timeNow()
     l.Logs		= make([]histlogentry, 0, 20)
     l.Day2Month		= d2m
     l.Weekstart		= weekstart
@@ -605,7 +605,7 @@ func Load(filename string) (*HistLog, error) {
 
     // We now fill in the fields which are not loaded and stored, and
     // carry private content
-    oneHL.lastChecked		= time.Now()
+    oneHL.lastChecked		= timeNow()
     oneHL.storePath		= filename
     oneHL.pendingLogs		= 0		// not needed, strictly
     oneHL.closed		= false
@@ -801,3 +801,33 @@ func (l *HistLog) Close() {
     l.tomonitor<- msg
     log.Println("Close: DEBUG: done")
 } // end Close(xxx)
+
+//
+// Parameterise the time.Now() operation by making it a function
+// variable, so that we can replace time.Now() with some other function
+// for testing purposes.
+//
+var timeNow func() time.Time = time.Now
+//
+// Can be called with the name of a function which will return the
+// "current" time, and will set this function in place of time.Now() for
+// the purposes of this package. One of the popular functions which can
+// be supplied to it is TimeNowEveryStep, with a step of time.Second or
+// time.Minute, so that the current time will start stepping in those
+// steps henceforth.
+//
+func SetTimeNow(tf func() time.Time) {
+    timeNow = tf
+}
+//
+// May be called with a step size (time.Duration) parameter, and will 
+// return a closure which will be an anonymous function which will step
+// by the given step size and return a new time every time it is called.
+//
+func TimeNowEveryStep(step time.Duration) func() time.Time {
+    var  timecounter time.Time = time.Now()
+    return func() time.Time {
+	timecounter = timecounter.Add(step)
+	return timecounter
+    }
+}
