@@ -56,6 +56,7 @@ import (
     "log"
     "encoding/json"
     "strings"
+    "sort"
 )
 
 const (
@@ -93,6 +94,7 @@ type histlogentry struct {
     Count	Count_t
     Val		Val_t
 }
+type logList	[]histlogentry
 
 //
 // One HistLog object can hold one set of data points for historical statistics
@@ -100,7 +102,7 @@ type histlogentry struct {
 //
 type HistLog struct {
     lastChecked	time.Time	// timestamp of when we last checked for wraps
-    Logs	[]histlogentry
+    Logs	logList
     Day2Month	bool	// true means days collapse to months, false means days collapse to weeks
     Weekstart	time.Weekday	// Sun or Mon in most places, Fri in some Middle Eastern countries
     Agelimit	int	// in years, typically a small single-digit figure
@@ -186,7 +188,7 @@ func monitor(l *HistLog) {
 		    (*l).closed = true
 		    (*l).Logs	= nil	// free up space
 	    }
-	case <-time.After(time.Minute):
+	case <-time.After(monitorLoopDelay):
 	    log.Println("monitor: DEBUG: timer wakeup")
 	    if ((*l).closed) {
 		gotAnOrder--
@@ -313,11 +315,11 @@ func doWrap(l *HistLog) {
 // them with a new entry of the next "fatter" type.
 //
 func logEntryCollapse(l *HistLog, wrapfrom, collapseto entryType_t) {
-    var totalcount Count_t
-    var totalvals  Val_t
-    var thisentry histlogentry
+    var totalcount	Count_t
+    var totalvals	Val_t
+    var thisentry	histlogentry
     var lastyr, lastmth, lastweek, lastdate, lasthr, lastmin	int
-    var newLogs []histlogentry = make([]histlogentry, 0)
+    var newLogs		logList = make(logList, 0)
 
     {
 	var acertainmonth time.Month
@@ -356,7 +358,7 @@ func logEntryCollapse(l *HistLog, wrapfrom, collapseto entryType_t) {
 			elidxMTHWK: int16(lastweek),
 			elidxDATE: int16(lastdate),
 			elidxHR: int16(lasthr),
-			elidxMIN: int16(lastmin) }
+			elidxMIN: int16(lastmin)}
     thisentry.Elabel = onelabel
     if (*l).Day2Month {
 	thisentry.Elabel[elidxMTHWK] = int16(lastmth)
@@ -364,8 +366,51 @@ func logEntryCollapse(l *HistLog, wrapfrom, collapseto entryType_t) {
     newLogs = append(newLogs, thisentry)
     log.Printf("logEntryCollapse: DEBUG: old list =", len((*l).Logs),
 		"new list =", len(newLogs))
+    sort.Stable(newLogs)
     (*l).Logs = newLogs
 } // end logEntryCollapse()
+
+//
+// internal function to compare two elements of logList. Useful for
+// sort-related interface.
+//
+func (ll logList)Less(i, j int) bool {
+    if int(ll[i].T) < int(ll[j].T) {
+	return false	// a lower-level type, e.g. RAW, comes after a
+			// higher level type, e.g. MIN or HR
+    } else if int(ll[i].T) == int(ll[j].T) {
+	//
+	// When the types are the same, we start sorting based on
+	// timestamps, which is what the Elabel array of Five Ints is
+	//
+	var labeli, labelj uint64
+
+	labeli = uint64(ll[i].Elabel[elidxYR]) * 100000000 +
+		    uint64(ll[i].Elabel[elidxMTHWK]) * 1000000 +
+		    uint64(ll[i].Elabel[elidxDATE]) * 10000 +
+		    uint64(ll[i].Elabel[elidxHR]) * 100 +
+		    uint64(ll[i].Elabel[elidxMIN])
+	labelj = uint64(ll[j].Elabel[elidxYR]) * 100000000 +
+		    uint64(ll[j].Elabel[elidxMTHWK]) * 1000000 +
+		    uint64(ll[j].Elabel[elidxDATE]) * 10000 +
+		    uint64(ll[j].Elabel[elidxHR]) * 100 +
+		    uint64(ll[j].Elabel[elidxMIN])
+	log.Println("logList.Less: DEBUG: labeli =", labeli, "labelj =", labelj)
+	return labeli < labelj		// i has an older timestamp
+    } else {
+	return true
+    }
+}
+
+func (ll logList)Len() int {
+    return len(ll)
+}
+//
+// Internal function to swap two elements of a logList
+//
+func (ll logList)Swap(i, j int) {
+    ll[i], ll[j] = ll[j], ll[i]
+}
 
 //
 // Internal function to add a log entry to a HistLog instance. Called
@@ -447,8 +492,8 @@ func json2HLLElabel(elabeldata []interface{}) (*entryLabel_t) {
 // scans entries in a JSON-derived slice of histlogentry data and loads
 // this data into a slice of actual histlogentries and returns it
 //
-func json2HLlogs(logsslice []interface{}) (*[]histlogentry) {
-    var HLlogs	[]histlogentry = make([]histlogentry, 0)
+func json2HLlogs(logsslice []interface{}) (*logList) {
+    var HLlogs	logList = make(logList, 0)
     var HLentry histlogentry
 
     for _, v := range logsslice {
@@ -545,6 +590,14 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
 } // end json2HL()
 
 //
+// Internal function to sort the log entries of an instance in a
+// human-readable sequence, oldest to newest
+//
+func (l *HistLog) sortinternal () {
+
+}
+
+//
 // PUBLIC METHODS AND FUNCTIONS
 //
 
@@ -568,7 +621,7 @@ func json2HL(jsonblob *interface{}) (*HistLog, error) {
 func NewHistLog(d2m bool, weekstart time.Weekday, agelimit, af int,
 	club2mins bool) (l HistLog) {
     l.lastChecked	= timeNow()
-    l.Logs		= make([]histlogentry, 0, 20)
+    l.Logs		= make(logList, 0, 20)
     l.Day2Month		= d2m
     l.Weekstart		= weekstart
     l.Agelimit		= agelimit
@@ -803,6 +856,30 @@ func (l *HistLog) Close() {
 } // end Close(xxx)
 
 //
+// Called to pull out a human readable string version of the complete set
+// of log entries.
+//
+func (l *HistLog) Strings() (s string) {
+    return s
+}
+
+
+
+//
+// THE FOLLOWING VARIABLES AND FUNCTIONS ARE USEFUL FOR REGRESSION
+// TESTING OF THE PACKAGE. NOT USEFUL FOR PRODUCTION USE.
+//
+
+//
+// this variable decides how long is the interval between loops of the
+// monitor goroutines. In production, a minute is a good value. For
+// testing, shorter may be needed.
+//
+var monitorLoopDelay	time.Duration	= time.Minute
+func SetMonitorLoopDelay(d time.Duration) {
+    monitorLoopDelay = d
+}
+//
 // Parameterise the time.Now() operation by making it a function
 // variable, so that we can replace time.Now() with some other function
 // for testing purposes.
@@ -821,13 +898,33 @@ func SetTimeNow(tf func() time.Time) {
 }
 //
 // May be called with a step size (time.Duration) parameter, and will 
-// return a closure which will be an anonymous function which will step
-// by the given step size and return a new time every time it is called.
+// return a closure which will step by the given step size and return 
+// a new time every time it is called.
+//
+// The output of this function may be passed as input parameter to
+// SetTimeNow()
 //
 func TimeNowEveryStep(step time.Duration) func() time.Time {
     var  timecounter time.Time = time.Now()
     return func() time.Time {
 	timecounter = timecounter.Add(step)
+	return timecounter
+    }
+}
+//
+// Called with a slice of step sizes, and will step through this slice
+// and increment "current" time by each step size in turn, looping back
+// when the slice finishes. Returns a function which may be passed as
+// input parameter to SetTimeNow().
+//
+func TimeNowStepSlice (steps []int) func() time.Time {
+    var timecounter time.Time = time.Now()
+    var i int = 0
+    return func() time.Time {
+	timecounter = timecounter.Add(time.Duration(int64(time.Second) *
+					int64(steps[i])))
+	i++
+	if i == len(steps) { i = 0 }
 	return timecounter
     }
 }
